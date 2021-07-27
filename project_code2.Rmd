@@ -1,0 +1,264 @@
+---
+title: "Econ293 Final Project"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## R Markdown
+```{r load libraries}
+#devtools::install_github('susanathey/causalTree') 
+library(causalTree)
+library(tidyverse)
+library(grf)
+library(glmnet)
+library(splines)
+library(policytree)
+library(lmtest)
+library(sandwich)
+library(MASS)
+#source("/Users/leili/OneDrive - Adobe/MCI/misc/econ293-project/multi_arm_causal_forest.R")
+#source("/Users/leili/OneDrive - Adobe/MCI/misc/econ293-project/input_utilities.R")
+#source("/Users/leili/OneDrive - Adobe/MCI/misc/econ293-project/multi_regression_forest.R")
+#source("/Users/leili/OneDrive - Adobe/MCI/misc/econ293-project/RcppExports.R")
+source("/Users/leili/OneDrive - Adobe/MCI/misc/econ293-project/summary_rw_lm.R")
+```
+##calculate ATE, HTE, policytree 
+## Load data:
+The data are from a randomized controlled trial with on an e-commerce website, which tested the treatments of 7 difference product recommendations on visitor's conversion rates and order values.
+##treatment
+0 - no rec
+2 - all-apps
+```{r, cache=TRUE}
+rct_data <- readRDS("/Users/leili/OneDrive - Adobe/MCI/misc/econ293-project/randomized_larger_data.RDS")
+#sample 26000 from treatment 0
+set.seed(0)
+rct_data <- filter(rct_data,TreatmentID %in% c('0','2'))
+rct_data$TreatmentID <- ifelse(rct_data$TreatmentID=='2',1,as.numeric(rct_data$TreatmentID))
+control_sampled <- sample_n(filter(rct_data,TreatmentID==0),size=26000)
+rct_data_sampled <- rbind(control_sampled,filter(rct_data,TreatmentID==1))
+#shuffle dataframe
+rows <- sample(nrow(rct_data_sampled))
+rct_data_sampled <- rct_data_sampled[rows,]
+rct_data_sampled$CC_Plans_visit <- ifelse(rct_data_sampled$CC_Plans_visit=='tgt_undefined','0',rct_data_sampled$CC_Plans_visit)
+rct_data_sampled %>% group_by(TreatmentID) %>% summarise(n=n(),orderValue=mean(orderValue))
+```
+```{r, cache=TRUE}
+fmla_orderValue <- formula(paste('orderValue','~','TreatmentID'))
+ols_orderValue <- lm(fmla_orderValue, data = rct_data_sampled)
+summary(ols_orderValue)
+```
+```{r, cache=TRUE}
+#ATE with GRF
+#1 vs 2
+#One-hot encoding
+treament <- 'TreatmentID'
+outcome <- 'orderValue' 
+X <- model.matrix(formula(paste0("~", paste0(c(cate_variables, cont_variables), collapse="+"))), data=rct_data_sampled[,2:152])
+W = rct_data_sampled[,treament]
+Y = rct_data_sampled[,outcome]
+#estimate a causal forest for W = 0 vs W = 1
+forest_ATE <- causal_forest(
+                X = X,
+                W = W,
+                W.hat = 0.5,
+                Y = Y)
+forest_ate <- average_treatment_effect(forest_ATE)
+print(forest_ate)
+```
+```{r,cache=TRUE}
+#HTE
+# Get forest predictions. 
+tau.hat <- predict(forest_ATE)$predictions 
+m.hat <- forest_ATE$Y.hat  # E[Y|X] estimates
+e.hat <- forest_ATE$W.hat  # e(X) := E[W|X] estimates (or known quantity)
+tau.hat <- forest_ATE$predictions  # tau(X) estimates
+# Predicting mu.hat(X[i], 1) and mu.hat(X[i], 0) for obs in held-out sample
+# Note: to understand this, read equations 6-8 in this vignette
+# https://grf-labs.github.io/grf/articles/muhats.html
+mu.hat.0 <- m.hat - e.hat * tau.hat        # E[Y|X,W=0] = E[Y|X] - e(X)*tau(X)
+mu.hat.1 <- m.hat + (1 - e.hat) * tau.hat  # E[Y|X,W=1] = E[Y|X] + (1 - e(X))*tau(X)
+# Compute AIPW scores
+aipw.scores <- tau.hat + W / e.hat * (Y -  mu.hat.1) - (1 - W) / (1 - e.hat) * (Y -  mu.hat.0)
+rct_data_sampled_v2 <- rct_data_sampled
+#landing traffic vs navigational traffic
+rct_data_sampled_v2$session_position_1vsOthers <- factor(rct_data_sampled_v2$session_position < 2) 
+group <- 'session_position_1vsOthers'
+# Estimate average treatment effect conditional on group membership
+fmla <- formula(paste0('aipw.scores ~ factor(', group, ')'))
+ols <- lm(fmla, data=transform(rct_data_sampled_v2, aipw.scores=aipw.scores))
+summary(ols)
+```
+```{r}
+#chrome vs others
+group <- 'Browser'
+# Estimate average treatment effect conditional on group membership
+fmla <- formula(paste0('aipw.scores ~ factor(', group, ')'))
+ols <- lm(fmla, data=transform(rct_data_sampled_v2, aipw.scores=aipw.scores))
+ols.res <- coeftest(ols, vcov = vcovHC(ols, "HC2"))
+indices <- which(names(coef(ols.res)) != '(Intercept)')
+summary_rw_lm(ols, indices=indices)
+```
+```{r}
+#baseline is missing data
+rct_data_sampled_v2$DemandBase <- ifelse(rct_data_sampled_v2$DemandBase=='','0',rct_data_sampled_v2$DemandBase)
+group <- 'DemandBase'
+# Estimate average treatment effect conditional on group membership
+fmla <- formula(paste0('aipw.scores ~ factor(', group, ')'))
+ols <- lm(fmla, data=transform(rct_data_sampled_v2, aipw.scores=aipw.scores))
+ols.res <- coeftest(ols, vcov = vcovHC(ols, "HC2"))
+indices <- which(names(coef(ols.res)) != '(Intercept)')
+summary_rw_lm(ols, indices=indices)
+```
+```{r}
+#use causaltree to discover subgroups with different treatment effects
+outcome <- 'orderValue'
+treatment <- 'TreatmentID'
+fmla <- paste(outcome, " ~", paste(c(cate_variables, cont_variables), collapse = " + "))
+# Dividing data into three subsets
+ct_data <- filter(rct_data_filtered,TreatmentID != '6')
+ct_data$TreatmentID <- ifelse(ct_data$TreatmentID=='1',0,1)
+ct_data$CC_Plans_visit <- ifelse(ct_data$CC_Plans_visit=='tgt_undefined','0',ct_data$CC_Plans_visit)
+ct_data$DemandBase <- ifelse(ct_data$DemandBase=='','0',ct_data$DemandBase)
+#combine DemandBase values into business, residential, and unknown
+ct_data$DemandBase <- ifelse(ct_data$DemandBase %in% c('Enterprise Business','Government','Mid-Market Business','SMB'),'BIZ',ifelse(ct_data$DemandBase=='Education','Edu',ifelse(ct_data$DemandBase=='Residential','Resid','0')))
+indices <- split(seq(nrow(ct_data)), sort(seq(nrow(ct_data)) %% 3))
+names(indices) <- c('split', 'est', 'test')
+# Fitting the tree
+ct.unpruned <- honest.causalTree(
+  formula=fmla,            # Define the model
+  data=ct_data[indices$split,],
+  treatment=ct_data[indices$split, treatment],
+  est_data=ct_data[indices$est,],
+  est_treatment=ct_data[indices$est, treatment],
+  minsize=1,                 # Min. number of treatment and control cases in each leaf
+  HonestSampleSize=length(indices$est), #  Num obs used in estimation after splitting
+  # We recommend not changing the parameters below
+  split.Rule="CT",            # Define the splitting option
+  cv.option="TOT",            # Cross validation options
+  cp=0,                       # Complexity parameter
+  split.Honest=TRUE,          # Use honesty when splitting
+  cv.Honest=TRUE              # Use honesty when performing cross-validation
+)
+# Table of cross-validated values by tuning parameter.
+ct.cptable <- as.data.frame(ct.unpruned$cptable)
+# Obtain optimal complexity parameter to prune tree.
+cp.selected <- which.min(ct.cptable$xerror)
+cp.optimal <- ct.cptable[cp.selected, "CP"]
+# Prune the tree at optimal complexity parameter.
+ct.pruned <- prune(tree=ct.unpruned, cp=2.891680e-06)
+# Predict point estimates (on estimation sample)
+tau.hat.est <- predict(ct.pruned, newdata=ct_data[indices$est,])
+# Create a factor column 'leaf' indicating leaf assignment in the estimation set
+num.leaves <- length(unique(tau.hat.est))
+leaf <- factor(tau.hat.est, levels=sort(unique(tau.hat.est)), labels = seq(num.leaves))
+rpart.plot(
+  x=ct.pruned,        # Pruned tree
+  type=3,             # Draw separate split labels for the left and right directions
+  fallen=TRUE,        # Position the leaf nodes at the bottom of the graph
+  leaf.round=1,       # Rounding of the corners of the leaf node boxes
+  extra=100,          # Display the percentage of observations in the node
+  branch=.1,          # Shape of the branch lines
+  box.palette="RdBu") # Palette for coloring the node
+```
+```{r,cache=TRUE}
+#HTE with GRF
+# dataset
+HTE_data <- rct_data_sampled 
+treatment <- "TreatmentID"
+outcome <- "orderValue"
+covariates <- as.vector(colnames(HET_data)[2:152])
+fmla <- formula(paste0("~ 0 +", paste0(covariates, collapse="+")))
+X <- model.matrix(fmla, HTE_data)
+W <- HTE_data[,treatment]
+Y <- HTE_data[,outcome]
+n <- nrow(HET_data)
+# Number of rankings that the predictions will be ranking on 
+num.rankings <- 5  
+# Prepare for data.splitting
+# Assign a fold number to each observation.
+# The argument 'clusters' in the next step will mimic K-fold cross-fitting.
+num.folds <- 10
+folds <- sort(seq(n) %% num.folds) + 1
+# Randomized settings with fixed and known probabilities (here: 0.5).
+forest <- causal_forest(X, Y, W, W.hat=.5, clusters = folds)
+# Retrieve out-of-bag predictions.
+# Predictions for observation in fold k will be computed using 
+# trees that were not trained using observations for that fold.
+tau.hat <- predict(forest)$predictions
+# Rank observations *within each fold* into quintiles according to their CATE predictions.
+ranking <- rep(NA, n)
+for (fold in seq(num.folds)) {
+  tau.hat.quantiles <- quantile(tau.hat[folds == fold], probs = seq(0, 1, by=1/num.rankings))
+  ranking[folds == fold] <- cut(tau.hat[folds == fold], tau.hat.quantiles, include.lowest=TRUE,labels=seq(num.rankings))
+}
+# Valid only in randomized settings.
+# Average difference-in-means within each ranking
+# Formula y ~ 0 + ranking + ranking:w
+fmla <- paste0(outcome, " ~ 0 + ranking + ranking:", treatment)
+ols.ate <- lm(fmla, data=transform(HTE_data, ranking=factor(ranking)))
+ols.ate <- coeftest(ols.ate, vcov=vcovHC(ols.ate, type='HC2'))
+interact <- which(grepl(":", rownames(ols.ate)))
+ols.ate <- data.frame("ols", paste0("Q", seq(num.rankings)), ols.ate[interact, 1:2])
+rownames(ols.ate) <- NULL # just for display
+colnames(ols.ate) <- c("method", "ranking", "estimate", "std.err")
+ols.ate
+```
+```{r}
+# Computing AIPW scores.
+tau.hat <- predict(forest)$predictions
+e.hat <- forest$W.hat # P[W=1|X]
+m.hat <- forest$Y.hat # E[Y|X]
+# Estimating mu.hat(X, 1) and mu.hat(X, 0) for obs in held-out sample
+# Note: to understand this, read equations 6-8 in this vignette:
+# https://grf-labs.github.io/grf/articles/muhats.html
+mu.hat.0 <- m.hat - e.hat * tau.hat        # E[Y|X,W=0] = E[Y|X] - e(X)*tau(X)
+mu.hat.1 <- m.hat + (1 - e.hat) * tau.hat  # E[Y|X,W=1] = E[Y|X] + (1 - e(X))*tau(X)
+# AIPW scores
+aipw.scores <- tau.hat + W / e.hat * (Y -  mu.hat.1) - (1 - W) / (1 - e.hat) * (Y -  mu.hat.0)
+ols <- lm(aipw.scores ~ 0 + factor(ranking))
+forest.ate <- data.frame("aipw", paste0("Q", seq(num.rankings)), coeftest(ols, vcov=vcovHC(ols, "HC2"))[,1:2])
+colnames(forest.ate) <- c("method", "ranking", "estimate", "std.err")
+rownames(forest.ate) <- NULL # just for display
+forest.ate
+```
+```{r}
+# Concatenate the two results.
+res <- rbind(forest.ate, ols.ate)
+# Plotting the point estimate of average treatment effect 
+# and 95% confidence intervals around it.
+ggplot(res) +
+  aes(x = ranking, y = estimate, group=method, color=method) + 
+  geom_point(position=position_dodge(0.2)) +
+  geom_errorbar(aes(ymin=estimate-2*std.err, ymax=estimate+2*std.err), width=.2, position=position_dodge(0.2)) +
+  ylab("") + xlab("") +
+  ggtitle("Average CATE within each ranking (as defined by predicted CATE)") +
+  theme_minimal() +
+  theme(legend.position="bottom", legend.title = element_blank())
+```
+```{r}
+best_linear_projection(forest, X)
+```
+```{r}
+#ATE with GRF
+#1 vs 6
+#One-hot encoding
+X1vs6 <- model.matrix(formula(paste0("~", paste0(c(cate_variables, cont_variables), collapse="+"))), data=select(filter(rct_data_filtered,TreatmentID != '2'),c(cate_variables, cont_variables)))
+#estimate a causal forest for 1 vs 6
+forest_1vs6 <- causal_forest(
+                X = X1vs6,
+                W = ifelse(filter(rct_data_filtered,TreatmentID != '2')[,'TreatmentID']=='1',0,1),
+                W.hat = 0.5,
+                Y = filter(rct_data_filtered,TreatmentID != '2')[,'orderValue']) 
+forest_1vs6.ate <- average_treatment_effect(forest_1vs6)
+print(forest_1vs6.ate)
+```
+```{r}
+#ATE with multi arm causal forest
+W <- rct_data_filtered$TreatmentID
+levels(W) <- c("1","2","6")
+X <- model.matrix(formula(paste0("~", paste0(c(cate_variables, cont_variables), collapse="+"))), data=select(rct_data_filtered,c(cate_variables, cont_variables)))
+Y <- rct_data_filtered$orderValue
+multi.arm.forest <- multi_arm_causal_forest(X, Y, W)
+```
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
